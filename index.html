@@ -298,11 +298,11 @@
   <div class="wallcards" id="wallcards"><div class="wallempty">Waiting for the room&hellip;</div></div>
 </div>
 
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
-/* ====== FIREBASE CONFIG (filled in during setup) ====== */
-const firebaseConfig = null;
+/* ====== SUPABASE CONFIG ====== */
+const SUPABASE_URL = "https://hqwfgmixmcifjqdabwzv.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imhxd2ZnbWl4bWNpZmpxZGFid3p2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM2MTM3MjMsImV4cCI6MjA5OTE4OTcyM30.8FPA_RfaCbloc6ArdeEIoKoDTFLEb_H-OR8428HAHeE";
 
 const QTITLES = {
   q1:"What might make Jordan hesitate?",
@@ -312,16 +312,18 @@ const QTITLES = {
   commit:"The moments we will personally protect"
 };
 
-let db = null;
+let sb = null;
 try{
-  if (typeof firebaseConfig === 'object' && firebaseConfig.apiKey){
-    firebase.initializeApp(firebaseConfig);
-    db = firebase.database();
+  if (window.supabase && SUPABASE_URL && SUPABASE_ANON_KEY){
+    sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
   }
-}catch(e){ console.warn('Firebase not configured yet', e); }
+}catch(e){ console.warn('Supabase not configured yet', e); }
+
+function esc(s){ return String(s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+const isWall = new URLSearchParams(location.search).has('wall');
 
 /* ---------- WALL MODE ---------- */
-const isWall = new URLSearchParams(location.search).has('wall');
 if (isWall){
   document.body.classList.add('wall');
   let cur='q1';
@@ -329,6 +331,7 @@ if (isWall){
   const title=document.getElementById('walltitle');
   const count=document.getElementById('wallcount');
   const store={q1:[],q2:[],q3:[],fb:[],commit:[]};
+
   function render(){
     title.textContent = QTITLES[cur];
     const list = store[cur];
@@ -336,32 +339,44 @@ if (isWall){
     cards.innerHTML = list.length ? '' : '<div class="wallempty">Waiting for the room&hellip;</div>';
     [...list].reverse().forEach(r=>{
       const d=document.createElement('div'); d.className='wallcard'+(cur==='commit'?' gold':'');
-      const lens = r.lens ? ' \u00b7 '+r.lens : '';
+      const lens = r.lens ? ' \u00b7 '+esc(r.lens) : '';
       d.innerHTML = `<div class="who">${esc(r.name)||'Anonymous'}${lens}</div><div class="what">${esc(r.text)}</div>`;
       cards.appendChild(d);
     });
   }
+
   document.querySelectorAll('#qtabs button').forEach(b=>{
     b.addEventListener('click',()=>{
       document.querySelectorAll('#qtabs button').forEach(x=>x.classList.remove('sel'));
       b.classList.add('sel'); cur=b.dataset.q; render();
     });
   });
-  if (db){
-    Object.keys(store).forEach(q=>{
-      db.ref('responses/'+q).on('child_added', snap=>{
-        store[q].push(snap.val()); if(q===cur) render();
-      });
-    });
+
+  async function loadAll(){
+    if(!sb){ cards.innerHTML='<div class="wallempty">Supabase is not configured yet.</div>'; return; }
+    const { data, error } = await sb.from('responses').select('*').order('id',{ascending:true});
+    if(error){ console.error(error); cards.innerHTML='<div class="wallempty">Could not load responses.</div>'; return; }
+    Object.keys(store).forEach(k=>store[k]=[]);
+    (data||[]).forEach(row=>{ if(store[row.q]) store[row.q].push(row); });
+    render();
+  }
+
+  if(sb){
+    loadAll();
+    // realtime: append new rows as they arrive
+    sb.channel('responses-wall')
+      .on('postgres_changes',{event:'INSERT',schema:'public',table:'responses'},payload=>{
+        const row=payload.new;
+        if(store[row.q]){ store[row.q].push(row); if(row.q===cur) render(); }
+      })
+      .subscribe();
   } else {
-    cards.innerHTML='<div class="wallempty">Firebase is not configured yet.</div>';
+    cards.innerHTML='<div class="wallempty">Supabase is not configured yet.</div>';
   }
   render();
 }
 
 /* ---------- PARTICIPANT MODE ---------- */
-function esc(s){ return String(s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-
 if (!isWall){
   const ACTS = [
    {n:"ACT I", img:"img/image6.jpg", c:"var(--teal)", t:"The Welcome", q:"\u201cI came back. Did anyone notice?\u201d",
@@ -466,17 +481,22 @@ if (!isWall){
 
   // share buttons
   document.querySelectorAll('.sendbtn').forEach(btn=>{
-    btn.addEventListener('click',()=>{
+    btn.addEventListener('click', async ()=>{
       const q = btn.dataset.q;
       const srcId = q==='commit' ? 'commit_txt' : q;
       const text = document.getElementById(srcId).value.trim();
       const name = document.getElementById('cname').value.trim();
       if(!text){ document.getElementById(srcId).focus(); return; }
       if(!name){ document.getElementById('cname').focus(); document.getElementById('cname').scrollIntoView({behavior:'smooth',block:'center'}); return; }
-      const payload = {name, text, ts:Date.now()};
-      if(q==='fb' && lens) payload.lens = lens;
-      if(db){
-        db.ref('responses/'+q).push(payload);
+      const row = {q, name, text};
+      if(q==='fb' && lens) row.lens = lens;
+      if(sb){
+        btn.disabled = true;
+        const { error } = await sb.from('responses').insert(row);
+        btn.disabled = false;
+        if(error){ console.error(error); alert('Could not share \u2014 please try again.'); return; }
+        document.getElementById(srcId).value='';
+        try{ localStorage.setItem('phx_'+srcId,''); }catch(e){}
       }
       const s=document.getElementById(q+'sent');
       if(s){ s.classList.add('show'); setTimeout(()=>s.classList.remove('show'),2000); }
@@ -484,19 +504,28 @@ if (!isWall){
   });
 
   // live feeds under each question
-  if(db){
+  if(sb){
     const feeds={q1:'q1feed', q2:'q2feed', q3:'q3feed', fb:'fbfeed', commit:'commitfeed'};
-    Object.entries(feeds).forEach(([q,fid])=>{
+    function addItem(row){
+      const fid=feeds[row.q]; if(!fid) return;
       const feed=document.getElementById(fid);
-      db.ref('responses/'+q).limitToLast(30).on('child_added', snap=>{
-        const r=snap.val();
-        const emp=feed.querySelector('.empty'); if(emp) emp.remove();
-        const d=document.createElement('div'); d.className='item';
-        const lensTxt = r.lens? ' \u00b7 '+esc(r.lens):'';
-        d.innerHTML=`<b>${esc(r.name)||'Anonymous'}${lensTxt}</b><br>${esc(r.text)}`;
-        feed.appendChild(d);
-      });
-    });
+      const emp=feed.querySelector('.empty'); if(emp) emp.remove();
+      const d=document.createElement('div'); d.className='item';
+      const lensTxt = row.lens? ' \u00b7 '+esc(row.lens):'';
+      d.innerHTML=`<b>${esc(row.name)||'Anonymous'}${lensTxt}</b><br>${esc(row.text)}`;
+      feed.appendChild(d);
+    }
+    // load existing
+    (async ()=>{
+      const { data, error } = await sb.from('responses').select('*').order('id',{ascending:true});
+      if(!error && data) data.forEach(addItem);
+    })();
+    // realtime new inserts
+    sb.channel('responses-feed')
+      .on('postgres_changes',{event:'INSERT',schema:'public',table:'responses'},payload=>{
+        addItem(payload.new);
+      })
+      .subscribe();
   }
 
   // nav highlight
